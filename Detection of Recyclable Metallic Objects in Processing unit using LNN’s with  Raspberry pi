@@ -1,0 +1,313 @@
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras.preprocessing.image import load_img, img_to_array  # Correct import
+class LTCCell(tf.keras.layers.Layer):
+    def __init__(self, units, ode_unfolds=3, epsilon=1e-8, **kwargs):
+        super(LTCCell, self).__init__(**kwargs)
+        self.units = units
+        self._init_ranges = {
+            "gleak": (0.001, 1.0),
+            "vleak": (-0.2, 0.2),
+            "cm": (0.4, 0.6),
+            "w": (0.001, 1.0),
+            "sigma": (3, 8),
+            "mu": (0.3, 0.8),
+            "sensory_w": (0.001, 1.0),
+            "sensory_sigma": (3, 8),
+            "sensory_mu": (0.3, 0.8),
+        }
+        self._ode_unfolds = int(ode_unfolds)  # Ensure _ode_unfolds is an integer
+        self._epsilon = epsilon
+
+    @property
+    def state_size(self):
+        return self.units
+
+    @property
+    def sensory_size(self):
+        return self.input_dim
+
+    def _get_initializer(self, param_name):
+        minval, maxval = self._init_ranges[param_name]
+        if minval == maxval:
+            return tf.keras.initializers.Constant(minval)
+        else:
+            return tf.keras.initializers.RandomUniform(minval, maxval)
+
+    def _erev_initializer(self, shape=None, dtype=None):
+        return np.random.default_rng().choice([-1, 1], size=shape)
+
+    def build(self, input_shape):
+        if isinstance(input_shape[0], (tuple, list)):
+            input_shape = input_shape[0]
+        self.input_dim = input_shape[-1]
+
+        self._params = {}
+        self._params["gleak"] = self.add_weight(
+            name="gleak", shape=(self.state_size,), dtype=tf.float32, constraint=tf.keras.constraints.NonNeg(),
+            initializer=self._get_initializer("gleak")
+        )
+        self._params["vleak"] = self.add_weight(
+            name="vleak", shape=(self.state_size,), dtype=tf.float32,
+            initializer=self._get_initializer("vleak")
+        )
+        self._params["cm"] = self.add_weight(
+            name="cm", shape=(self.state_size,), dtype=tf.float32, constraint=tf.keras.constraints.NonNeg(),
+            initializer=self._get_initializer("cm")
+        )
+        self._params["sigma"] = self.add_weight(
+            name="sigma", shape=(self.state_size, self.state_size), dtype=tf.float32,
+            initializer=self._get_initializer("sigma")
+        )
+        self._params["mu"] = self.add_weight(
+            name="mu", shape=(self.state_size, self.state_size), dtype=tf.float32,
+            initializer=self._get_initializer("mu")
+        )
+        self._params["w"] = self.add_weight(
+            name="w", shape=(self.state_size, self.state_size), dtype=tf.float32, constraint=tf.keras.constraints.NonNeg(),
+            initializer=self._get_initializer("w")
+        )
+        self._params["erev"] = self.add_weight(
+            name="erev", shape=(self.state_size, self.state_size), dtype=tf.float32,
+            initializer=self._erev_initializer
+        )
+
+        self._params["sensory_sigma"] = self.add_weight(
+            name="sensory_sigma", shape=(self.sensory_size, self.state_size), dtype=tf.float32,
+            initializer=self._get_initializer("sensory_sigma")
+        )
+        self._params["sensory_mu"] = self.add_weight(
+            name="sensory_mu", shape=(self.sensory_size, self.state_size), dtype=tf.float32,
+            initializer=self._get_initializer("sensory_mu")
+        )
+        self._params["sensory_w"] = self.add_weight(
+            name="sensory_w", shape=(self.sensory_size, self.state_size), dtype=tf.float32, constraint=tf.keras.constraints.NonNeg(),
+            initializer=self._get_initializer("sensory_w")
+        )
+        self._params["sensory_erev"] = self.add_weight(
+            name="sensory_erev", shape=(self.sensory_size, self.state_size), dtype=tf.float32,
+            initializer=self._erev_initializer
+        )
+
+        self._params["input_w"] = self.add_weight(
+            name="input_w", shape=(self.sensory_size,), dtype=tf.float32,
+            initializer=tf.keras.initializers.Constant(1)
+        )
+        self._params["input_b"] = self.add_weight(
+            name="input_b", shape=(self.sensory_size,), dtype=tf.float32,
+            initializer=tf.keras.initializers.Constant(0)
+        )
+
+        self._params["output_w"] = self.add_weight(
+            name="output_w", shape=(self.state_size,), dtype=tf.float32,
+            initializer=tf.keras.initializers.Constant(1)
+        )
+        self._params["output_b"] = self.add_weight(
+            name="output_b", shape=(self.state_size,), dtype=tf.float32,
+            initializer=tf.keras.initializers.Constant(0)
+        )
+        self.built = True
+
+    def _sigmoid(self, v_pre, mu, sigma):
+        v_pre = tf.expand_dims(v_pre, axis=-1)
+        mues = v_pre - mu
+        x = sigma * mues
+        return tf.nn.sigmoid(x)
+
+    def _ode_solver(self, inputs, state, elapsed_time):
+        v_pre = state
+        sensory_w_activation = self._params["sensory_w"] * self._sigmoid(
+            inputs, self._params["sensory_mu"], self._params["sensory_sigma"]
+        )
+        sensory_rev_activation = sensory_w_activation * self._params["sensory_erev"]
+        w_numerator_sensory = tf.reduce_sum(sensory_rev_activation, axis=1)
+        w_denominator_sensory = tf.reduce_sum(sensory_w_activation, axis=1)
+
+        cm_t = self._params["cm"] / tf.cast(
+            (elapsed_time + 1e-3) / float(self._ode_unfolds), dtype=tf.float32
+        )
+
+        for t in range(self._ode_unfolds):
+            w_activation = self._params["w"] * self._sigmoid(
+                v_pre, self._params["mu"], self._params["sigma"]
+            )
+            rev_activation = w_activation * self._params["erev"]
+            w_numerator = tf.reduce_sum(rev_activation, axis=1) + w_numerator_sensory
+            w_denominator = tf.reduce_sum(w_activation, axis=1) + w_denominator_sensory
+            numerator = (
+                cm_t * v_pre
+                + self._params["gleak"] * self._params["vleak"]
+                + w_numerator
+            )
+            denominator = cm_t + self._params["gleak"] + w_denominator
+            v_pre = numerator / (denominator + self._epsilon)
+
+        return v_pre
+
+    def _map_inputs(self, inputs):
+        inputs = inputs * self._params["input_w"]
+        inputs = inputs + self._params["input_b"]
+        return inputs
+
+    def _map_outputs(self, state):
+        output = state
+        output = output * self._params["output_w"]
+        output = output + self._params["output_b"]
+        return output
+
+    def call(self, inputs, states):
+        if isinstance(inputs, (tuple, list)):
+            inputs, elapsed_time = inputs
+        else:
+            elapsed_time = 1.0
+        inputs = self._map_inputs(inputs)
+        next_state = self._ode_solver(inputs, states[0], elapsed_time)
+        outputs = self._map_outputs(next_state)
+        return outputs, [next_state]
+
+@tf.keras.utils.register_keras_serializable()
+class MixedLTCCell(tf.keras.layers.Layer):
+    def __init__(self, units, hparams, **kwargs):
+        super(MixedLTCCell, self).__init__(**kwargs)
+        self.units = units
+        self.state_size = (units, units)
+        self.initializer = "glorot_uniform"
+        self.recurrent_initializer = "orthogonal"
+        self.forget_gate_bias = 1
+        if "forget_bias" in hparams.keys():
+            self.forget_gate_bias = hparams["forget_bias"]
+        self.LTC = LTCCell(self.units, hparams.get("ode_unfolds", 3), hparams.get("epsilon", 1e-8))
+
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        return (
+            tf.zeros([batch_size, self.units], dtype=tf.float32),
+            tf.zeros([batch_size, self.units], dtype=tf.float32),
+        )
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        if isinstance(input_shape[0], tuple):
+            input_dim = input_shape[0][-1]
+        self.LTC.build(input_shape)
+        self.input_kernel = self.add_weight(
+            shape=(input_dim, 4 * self.units),
+            initializer=self.initializer,
+            name="input_kernel",
+        )
+        self.recurrent_kernel = self.add_weight(
+            shape=(self.units, 4 * self.units),
+            initializer=self.recurrent_initializer,
+            name="recurrent_kernel",
+        )
+        self.bias = self.add_weight(
+            shape=(4 * self.units,), initializer="zeros", name="bias"
+        )
+        self.built = True
+
+    def call(self, inputs, states):
+        h_tm1, c_tm1 = states
+        z = tf.keras.backend.dot(inputs, self.input_kernel)
+        z += tf.keras.backend.dot(h_tm1, self.recurrent_kernel)
+        z = z + self.bias
+
+        z0, z1, z2, z3 = tf.split(z, 4, axis=-1)
+
+        i = tf.keras.backend.sigmoid(z0)
+        f = tf.keras.backend.sigmoid(z1 + self.forget_gate_bias)
+        c = f * c_tm1 + i * tf.keras.backend.tanh(z2)
+        o = tf.keras.backend.sigmoid(z3)
+        h = o * tf.keras.backend.tanh(c)
+        out, state_ltc = self.LTC.call(inputs, (h_tm1,))
+
+        return out, [h, c]
+    
+# Load the trained model
+model_path = "saved_ltc_model (5).h5"  # Replace with your model's path
+model = tf.keras.models.load_model(model_path, custom_objects={'MixedLTCCell': MixedLTCCell})
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+# Load and preprocess a single image for prediction
+def preprocess_image(image_path, target_size):
+    img = load_img(image_path, target_size=target_size)  # Resize image
+    img_resized = img.resize((224, 224))
+    img_array = np.expand_dims(np.array(img_resized), axis=0)
+    img_array = preprocess_input(img_array)
+    return img_array
+def predict():
+    # Path to the image you want to predict
+    image_path = "image.jpg"  # Replace with your image's path
+    input_size = (224, 224)  # Replace with your model's input size if different
+    image = preprocess_image(image_path, input_size)
+
+    # Make the prediction
+    predictions = model.predict(image)
+    predicted_class = np.argmax(predictions, axis=1)
+    # Define a list of class names in the same order as the model's output
+    #class_names = ['Fruits/Vegetables' ,'Leaves','Electronics', 'Glass','Paper','Metal','Food','Medical','Plastic','Textile']
+    class_names = ['Cardboard','Food organics','Glass','Metal','Miscellineous','Paper','Plastic','Textile','Vegetation']
+    # Get the predicted class index
+    predicted_class_index = np.argmax(predictions, axis=1)
+
+    # Map the predicted class index to the class name
+    predicted_class_name = class_names[predicted_class_index[0]]  # Use the first prediction if batch size is 1
+
+    # Print the result
+    print(f"Predicted Class: {predicted_class_name}")
+
+    # Print the result
+    #print(f"Predicted Class: {predicted_class}")
+    return predicted_class_name
+
+import cv2
+from matplotlib import pyplot as plt
+
+def capture():
+    cap = cv2.VideoCapture('/dev/video0')
+
+    if not cap.isOpened():
+        print("Cannot open webcam")
+
+    ret, frame = cap.read()
+    if ret:
+        # Save image
+        cv2.imwrite("image.jpg", frame)
+    
+        # Use matplotlib to display the image
+        #plt.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        #plt.title("Captured Image")
+        #plt.axis("off")
+        #plt.show()
+    else:
+        print("Failed to capture frame")
+
+    cap.release()
+
+
+import RPi.GPIO as GPIO
+import time
+GPIO.setmode(GPIO.BCM)
+ard_pin=17
+metal= 27
+non=22
+GPIO.setup(non, GPIO.OUT)
+GPIO.setup(metal, GPIO.OUT)
+GPIO.setup(ard_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+while True:
+    if GPIO.input(ard_pin) == GPIO.HIGH:
+        Capture()
+        pred=predict()
+        if pred=="Metal":
+            x=metal
+        else:
+            x=non
+        GPIO.output(x, GPIO.HIGH)  # Turn LED on
+        time.sleep(1)                    # Wait 1 second
+        GPIO.output(x, GPIO.LOW)   # Turn LED off
+
+    GPIO.cleanup()
+    time.sleep(1)
+
+
+
+
+
